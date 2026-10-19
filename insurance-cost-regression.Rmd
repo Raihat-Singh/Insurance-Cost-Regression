@@ -1,0 +1,226 @@
+---
+title: "Insurance Cost Regression Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: show
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 8, fig.height = 5)
+library(tidyverse)   # dplyr, ggplot2, readr
+library(skimr)
+library(GGally)
+library(caret)
+library(randomForest)
+set.seed(42)
+theme_set(theme_minimal(base_size = 13))
+```
+
+## 1. Goal
+
+Predict individual medical insurance **expenses** from demographic and health attributes, and identify which factors drive cost. Models compared: multiple linear regression, a Box-Cox / log-transformed regression with an interaction, Random Forest, and Gradient Boosting.
+
+## 2. Load and inspect the data
+
+```{r load}
+ins <- read_csv("data/medical_insurance.csv")
+glimpse(ins)
+skim(ins)
+```
+
+## 3. Cleaning
+
+Three issues need handling:
+
+* `premium` is derived from `expenses` (a small percentage of it). Using it as a predictor would leak the target, so it is dropped.
+* `discount_eligibility` behaves like a smoker flag in this data (a small group with far higher expenses), so treat it as a *proxy* for smoking, not as a separate factor.
+* Duplicate rows and factor types.
+
+```{r clean}
+cor(ins$expenses, ins$premium)          # shows the leakage
+
+ins <- ins %>%
+  distinct() %>%
+  dplyr::select(-premium) %>%
+  mutate(
+    gender = factor(gender),
+    discount_eligibility = factor(discount_eligibility, levels = c("no", "yes")),
+    region = factor(region)
+  )
+
+cat("Rows after cleaning:", nrow(ins), "\n")
+colSums(is.na(ins))
+```
+
+## 4. Exploratory data analysis
+
+### Distribution of the target
+
+```{r eda-target}
+p1 <- ggplot(ins, aes(expenses)) + geom_histogram(bins = 40, fill = "#6a5af0", colour = "white") +
+  labs(title = "Expenses are right-skewed", x = "Expenses")
+p2 <- ggplot(ins, aes(log(expenses))) + geom_histogram(bins = 40, fill = "#00b8a9", colour = "white") +
+  labs(title = "Log expenses are closer to normal", x = "log(Expenses)")
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+### Categorical drivers
+
+```{r eda-cat}
+ins %>%
+  pivot_longer(c(gender, discount_eligibility, region), names_to = "var", values_to = "level") %>%
+  ggplot(aes(level, expenses, fill = level)) +
+  geom_boxplot(show.legend = FALSE) +
+  facet_wrap(~var, scales = "free_x") +
+  scale_fill_viridis_d(option = "C", end = .85) +
+  labs(title = "Expenses by category", x = NULL)
+```
+
+### Numeric drivers
+
+```{r eda-num}
+ggplot(ins, aes(bmi, expenses, colour = discount_eligibility)) +
+  geom_point(alpha = .6) + geom_smooth(method = "lm", se = FALSE) +
+  scale_colour_manual(values = c(no = "#6a5af0", yes = "#ff5a36")) +
+  labs(title = "BMI vs expenses, split by discount eligibility (smoker proxy)")
+
+ggplot(ins, aes(age, expenses, colour = discount_eligibility)) +
+  geom_point(alpha = .6) +
+  scale_colour_manual(values = c(no = "#6a5af0", yes = "#ff5a36")) +
+  labs(title = "Age vs expenses")
+
+ggpairs(ins, columns = c("age", "bmi", "children", "expenses"))
+```
+
+## 5. Train / test split
+
+```{r split}
+idx   <- createDataPartition(ins$expenses, p = 0.8, list = FALSE)
+train <- ins[idx, ]
+test  <- ins[-idx, ]
+c(train = nrow(train), test = nrow(test))
+
+metrics <- function(actual, pred, model) {
+  tibble(Model = model,
+         RMSE = sqrt(mean((actual - pred)^2)),
+         MAE  = mean(abs(actual - pred)),
+         R2   = cor(actual, pred)^2)
+}
+```
+
+## 6. Model 1: multiple linear regression
+
+```{r lm1}
+m1 <- lm(expenses ~ ., data = train)
+summary(m1)
+```
+
+### Diagnostics
+
+```{r lm1-diag, fig.height=7}
+par(mfrow = c(2, 2)); plot(m1); par(mfrow = c(1, 1))
+car::vif(m1)
+```
+
+Check the residual plots: a funnel shape or curved trend means the linear model on raw expenses is mis-specified.
+
+## 7. Model 2: Box-Cox transformation and interaction
+
+```{r boxcox}
+bc <- MASS::boxcox(m1, lambda = seq(-1, 1, 0.05))
+lambda <- bc$x[which.max(bc$y)]
+lambda
+```
+
+A lambda near 0 supports a log transform of expenses. The scatter plot above also shows the BMI effect is much steeper for the smoker-proxy group, so add an interaction.
+
+```{r lm2}
+m2 <- lm(log(expenses) ~ age + bmi * discount_eligibility + children + gender + region, data = train)
+summary(m2)
+par(mfrow = c(2, 2)); plot(m2); par(mfrow = c(1, 1))
+```
+
+Add an obesity threshold effect (BMI of 30 or more) as a further variant:
+
+```{r lm3}
+train <- train %>% mutate(obese = factor(bmi >= 30))
+test  <- test  %>% mutate(obese = factor(bmi >= 30))
+m3 <- lm(log(expenses) ~ age + bmi + obese * discount_eligibility + children + gender + region, data = train)
+summary(m3)
+AIC(m2, m3)   # lower is better (the models are not nested, so anova() would be invalid)
+```
+
+## 8. Models 3 and 4: Random Forest and Gradient Boosting
+
+```{r ml}
+ctrl <- trainControl(method = "cv", number = 5)
+f <- expenses ~ age + bmi + children + gender + discount_eligibility + region
+
+rf <- train(f, data = train, method = "rf", trControl = ctrl, ntree = 300,
+            tuneGrid = expand.grid(mtry = c(2, 4, 6, 8)), importance = TRUE)
+
+gbm_fit <- train(f, data = train, method = "gbm", trControl = ctrl, verbose = FALSE,
+                 tuneGrid = expand.grid(n.trees = c(100, 300, 500),
+                                        interaction.depth = c(1, 2, 3),
+                                        shrinkage = 0.05, n.minobsinnode = 10))
+rf$bestTune
+gbm_fit$bestTune
+```
+
+## 9. Compare models on the held-out test set
+
+```{r compare}
+pred <- tibble(
+  actual = test$expenses,
+  lm_raw = predict(m1, test),
+  lm_log_interaction = exp(predict(m2, test)),
+  lm_log_obese = exp(predict(m3, test)),
+  rf = predict(rf, test),
+  gbm = predict(gbm_fit, test)
+)
+
+results <- bind_rows(
+  metrics(pred$actual, pred$lm_raw, "Linear (raw)"),
+  metrics(pred$actual, pred$lm_log_interaction, "Log-linear + BMI x smoker-proxy"),
+  metrics(pred$actual, pred$lm_log_obese, "Log-linear + obese x smoker-proxy"),
+  metrics(pred$actual, pred$rf, "Random Forest"),
+  metrics(pred$actual, pred$gbm, "Gradient Boosting")
+) %>% arrange(RMSE)
+
+knitr::kable(results, digits = 3)
+```
+
+Back-transforming log predictions with `exp()` slightly underestimates the mean; a smearing correction would reduce that bias but is skipped here for simplicity.
+
+```{r pred-plot}
+pred %>%
+  pivot_longer(-actual, names_to = "model", values_to = "predicted") %>%
+  ggplot(aes(actual, predicted)) +
+  geom_point(alpha = .4, colour = "#6a5af0") +
+  geom_abline(colour = "#ff5a36", linewidth = 1) +
+  facet_wrap(~model) +
+  labs(title = "Predicted vs actual expenses (test set)")
+```
+
+## 10. What drives cost?
+
+```{r importance}
+plot(varImp(rf), main = "Random Forest variable importance")
+plot(varImp(gbm_fit), main = "Gradient Boosting variable importance")
+```
+
+## 11. Conclusions
+
+*Fill these in after knitting:*
+
+* Best model by test RMSE: ...
+* Most important drivers: ...
+* Effect of the BMI x smoker-proxy interaction: ...
+* Limitations: only 1,300 or so rows, no medical history or claims features, and `discount_eligibility` is probably a renamed smoker flag.
+
+```{r session}
+sessionInfo()
+```
